@@ -1,0 +1,70 @@
+name: Follow NodeWarden releases
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+    inputs:
+      verify_connection:
+        description: Trigger a Cloudflare dry run while still on the initial release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nodewarden-release-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    if: github.repository == 'Starrybty/nodewarden-cf' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: cf-production
+      - name: Check the latest official release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_CONNECTION: ${{ inputs.verify_connection }}
+        shell: bash
+        run: |
+          upstream=shuaiplus/nodewarden
+          latest=$(gh api "repos/$upstream/releases/latest" --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+          current=$(jq -er '.tag' cf-release.json)
+          stable='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$latest" =~ $stable || ! "$current" =~ $stable ]]; then
+            echo 'Expected stable version tags such as v1.8.1.' >&2
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [[ "$VERIFY_CONNECTION" == true ]]; then
+            if [[ "$current" != v1.8.1 ]]; then
+              echo 'The connection check is only available on the initial release.' >&2
+              exit 1
+            fi
+            jq --arg run "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" '.verification = $run' cf-release.json > cf-release.tmp
+            mv cf-release.tmp cf-release.json
+            message='Verify the Cloudflare connection without deploying'
+          elif [[ "$latest" == "$current" || $(printf '%s\n' "$latest" "$current" | sort -V | tail -1) != "$latest" ]]; then
+            echo "No newer stable release (tracked: $current, upstream: $latest)."
+            exit 0
+          else
+            refs=$(git ls-remote --exit-code "https://github.com/$upstream.git" "refs/tags/$latest" "refs/tags/$latest^{}")
+            commit=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$latest" '$2 == ref { tag = $1 } $2 == ref "^{}" { peeled = $1 } END { print peeled ? peeled : tag }')
+            if [[ ! "$commit" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "Could not resolve the official release commit for $latest." >&2
+              exit 1
+            fi
+            jq -n --arg tag "$latest" --arg commit "$commit" '{tag: $tag, commit: $commit}' > cf-release.json
+            message="Track NodeWarden $latest"
+          fi
+
+          git add cf-release.json
+          git commit -m "$message"
+          git push origin HEAD:refs/heads/cf-production
